@@ -21,6 +21,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -70,11 +71,33 @@ func (c *conntractStatsCollector) Update(ch chan<- prometheus.Metric) error {
 	conntrackCmd.Stdout = &stdout
 	err = conntrackCmd.Run()
 	if err != nil {
-		log.Errorf("error running %q: %v", CONNTRACK_BIN, err)
+		log.Errorf("Error running %q: %v", CONNTRACK_BIN, err)
 		return err
 	}
 
-	conntrackScanner := bufio.NewScanner(&stdout)
+	cpuStats, err := ConntrackStatsParseReader(&stdout)
+	if err != nil {
+		log.Errorf("Error parsing conntrack stream: %v", err)
+		return err
+	}
+
+	for _, cpuStat := range cpuStats {
+		insertFailedValue, ok := cpuStat.Stats[INSERT_FAILED_STAT]
+		if !ok {
+			log.Warnf("required stat %q missing from cpuid %v", INSERT_FAILED_STAT, cpuStat.Cpu)
+			continue
+		}
+
+		ch <- prometheus.MustNewConstMetric(c.insertFailed, prometheus.GaugeValue, float64(insertFailedValue), string(cpuStat.Cpu))
+	}
+
+	return nil
+}
+
+func ConntrackStatsParseReader(reader io.Reader) ([]CpuStat, error) {
+	var allStats []CpuStat
+
+	conntrackScanner := bufio.NewScanner(reader)
 
 	for conntrackScanner.Scan() {
 		line := conntrackScanner.Text()
@@ -90,22 +113,15 @@ func (c *conntractStatsCollector) Update(ch chan<- prometheus.Metric) error {
 			continue
 		}
 
-		insertFailedValue, ok := cpuStats.Stats[INSERT_FAILED_STAT]
-		if !ok {
-			log.Warnf("required stat %q missing from line %q", INSERT_FAILED_STAT, line)
-			continue
-		}
-
-		ch <- prometheus.MustNewConstMetric(c.insertFailed, prometheus.GaugeValue, float64(insertFailedValue), string(cpuStats.Cpu))
-
+		allStats = append(allStats, *cpuStats)
 	}
 
 	if err := conntrackScanner.Err(); err != nil {
 		log.Errorf("error getting output from %q: %v", CONNTRACK_BIN, err)
-		return err
+		return allStats, err
 	}
 
-	return nil
+	return allStats, nil
 }
 
 func conntrackBinExists() (bool, error) {
